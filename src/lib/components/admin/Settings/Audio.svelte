@@ -37,6 +37,8 @@
 	let TTS_AZURE_SPEECH_REGION = '';
 	let TTS_AZURE_SPEECH_BASE_URL = '';
 	let TTS_AZURE_SPEECH_OUTPUT_FORMAT = '';
+	let TTS_MISTRAL_API_KEY = '';
+	let TTS_MISTRAL_API_BASE_URL = '';
 
 	let STT_OPENAI_API_BASE_URL = '';
 	let STT_OPENAI_API_KEY = '';
@@ -124,6 +126,8 @@
 				AZURE_SPEECH_REGION: TTS_AZURE_SPEECH_REGION,
 				AZURE_SPEECH_BASE_URL: TTS_AZURE_SPEECH_BASE_URL,
 				AZURE_SPEECH_OUTPUT_FORMAT: TTS_AZURE_SPEECH_OUTPUT_FORMAT,
+				MISTRAL_API_KEY: TTS_MISTRAL_API_KEY,
+				MISTRAL_API_BASE_URL: TTS_MISTRAL_API_BASE_URL,
 				SPLIT_ON: TTS_SPLIT_ON
 			},
 			stt: {
@@ -176,6 +180,8 @@
 			TTS_AZURE_SPEECH_REGION = res.tts.AZURE_SPEECH_REGION;
 			TTS_AZURE_SPEECH_BASE_URL = res.tts.AZURE_SPEECH_BASE_URL;
 			TTS_AZURE_SPEECH_OUTPUT_FORMAT = res.tts.AZURE_SPEECH_OUTPUT_FORMAT;
+			TTS_MISTRAL_API_KEY = res.tts.MISTRAL_API_KEY;
+			TTS_MISTRAL_API_BASE_URL = res.tts.MISTRAL_API_BASE_URL;
 
 			STT_OPENAI_API_BASE_URL = res.stt.OPENAI_API_BASE_URL;
 			STT_OPENAI_API_KEY = res.stt.OPENAI_API_KEY;
@@ -212,7 +218,7 @@
 			<div>
 				<div class=" mt-0.5 mb-2.5 text-base font-medium">{$i18n.t('Speech-to-Text')}</div>
 
-				<hr class=" border-gray-100 dark:border-gray-850 my-2" />
+				<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 				{#if STT_ENGINE !== 'web'}
 					<div class="mb-2">
@@ -235,7 +241,7 @@
 					<div class=" self-center text-xs font-medium">{$i18n.t('Speech-to-Text Engine')}</div>
 					<div class="flex items-center relative">
 						<select
-							class="dark:bg-gray-900 cursor-pointer w-fit pr-8 rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
+							class="cursor-pointer w-fit pr-8 rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
 							bind:value={STT_ENGINE}
 							placeholder={$i18n.t('Select an engine')}
 						>
@@ -263,7 +269,7 @@
 						</div>
 					</div>
 
-					<hr class="border-gray-100 dark:border-gray-850 my-2" />
+					<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 					<div>
 						<div class=" mb-1.5 text-xs font-medium">{$i18n.t('STT Model')}</div>
@@ -289,7 +295,7 @@
 						</div>
 					</div>
 
-					<hr class="border-gray-100 dark:border-gray-850 my-2" />
+					<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 					<div>
 						<div class=" mb-1.5 text-xs font-medium">{$i18n.t('STT Model')}</div>
@@ -323,7 +329,7 @@
 							/>
 						</div>
 
-						<hr class="border-gray-100 dark:border-gray-850 my-2" />
+						<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 						<div>
 							<div class=" mb-1.5 text-xs font-medium">{$i18n.t('Azure Region')}</div>
@@ -391,7 +397,7 @@
 						</div>
 					</div>
 
-					<hr class="border-gray-100 dark:border-gray-850 my-2" />
+					<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 					<div>
 						<div class=" mb-1.5 text-xs font-medium">{$i18n.t('STT Model')}</div>
@@ -416,7 +422,7 @@
 						</div>
 					</div>
 
-					<hr class="border-gray-100 dark:border-gray-850 my-2" />
+					<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 					<div>
 						<div class="flex items-center justify-between mb-2">
@@ -500,13 +506,13 @@
 			<div>
 				<div class=" mt-0.5 mb-2.5 text-base font-medium">{$i18n.t('Text-to-Speech')}</div>
 
-				<hr class=" border-gray-100 dark:border-gray-850 my-2" />
+				<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 				<div class="mb-2 py-0.5 flex w-full justify-between">
 					<div class=" self-center text-xs font-medium">{$i18n.t('Text-to-Speech Engine')}</div>
 					<div class="flex items-center relative">
 						<select
-							class=" dark:bg-gray-900 w-fit pr-8 cursor-pointer rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
+							class="w-fit pr-8 cursor-pointer rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
 							bind:value={TTS_ENGINE}
 							placeholder={$i18n.t('Select a mode')}
 							on:change={async (e) => {
@@ -517,6 +523,9 @@
 								if (e.target?.value === 'openai') {
 									TTS_VOICE = 'alloy';
 									TTS_MODEL = 'tts-1';
+								} else if (e.target?.value === 'mistral') {
+									TTS_VOICE = '';
+									TTS_MODEL = 'voxtral-mini-tts-2603';
 								} else {
 									TTS_VOICE = '';
 									TTS_MODEL = '';
@@ -528,6 +537,7 @@
 							<option value="openai">{$i18n.t('OpenAI')}</option>
 							<option value="elevenlabs">{$i18n.t('ElevenLabs')}</option>
 							<option value="azure">{$i18n.t('Azure AI Speech')}</option>
+							<option value="mistral">{$i18n.t('MistralAI')}</option>
 						</select>
 					</div>
 				</div>
@@ -548,12 +558,7 @@
 				{:else if TTS_ENGINE === 'elevenlabs'}
 					<div>
 						<div class="mt-1 flex gap-2 mb-1">
-							<input
-								class="flex-1 w-full rounded-lg py-2 pl-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
-								placeholder={$i18n.t('API Key')}
-								bind:value={TTS_API_KEY}
-								required
-							/>
+							<SensitiveInput placeholder={$i18n.t('API Key')} bind:value={TTS_API_KEY} required />
 						</div>
 					</div>
 				{:else if TTS_ENGINE === 'azure'}
@@ -562,7 +567,7 @@
 							<SensitiveInput placeholder={$i18n.t('API Key')} bind:value={TTS_API_KEY} required />
 						</div>
 
-						<hr class="border-gray-100 dark:border-gray-850 my-2" />
+						<hr class="border-gray-100/30 dark:border-gray-850/30 my-2" />
 
 						<div>
 							<div class=" mb-1.5 text-xs font-medium">{$i18n.t('Azure Region')}</div>
@@ -588,6 +593,19 @@
 									/>
 								</div>
 							</div>
+						</div>
+					</div>
+				{:else if TTS_ENGINE === 'mistral'}
+					<div>
+						<div class="mt-1 flex gap-2 mb-1">
+							<input
+								class="flex-1 w-full bg-transparent outline-hidden"
+								placeholder={$i18n.t('API Base URL')}
+								bind:value={TTS_MISTRAL_API_BASE_URL}
+								required
+							/>
+
+							<SensitiveInput placeholder={$i18n.t('API Key')} bind:value={TTS_MISTRAL_API_KEY} />
 						</div>
 					</div>
 				{/if}
@@ -796,6 +814,47 @@
 								</div>
 							</div>
 						</div>
+					{:else if TTS_ENGINE === 'mistral'}
+						<div class=" flex gap-2">
+							<div class="w-full">
+								<div class=" mb-1.5 text-xs font-medium">{$i18n.t('TTS Voice')}</div>
+								<div class="flex w-full">
+									<div class="flex-1">
+										<input
+											list="voice-list"
+											class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+											bind:value={TTS_VOICE}
+											placeholder={$i18n.t('Select a voice')}
+										/>
+
+										<datalist id="voice-list">
+											{#each voices as voice}
+												<option value={voice.id}>{voice.name}</option>
+											{/each}
+										</datalist>
+									</div>
+								</div>
+							</div>
+							<div class="w-full">
+								<div class=" mb-1.5 text-xs font-medium">{$i18n.t('TTS Model')}</div>
+								<div class="flex w-full">
+									<div class="flex-1">
+										<input
+											list="tts-model-list"
+											class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+											bind:value={TTS_MODEL}
+											placeholder={$i18n.t('Select a model')}
+										/>
+
+										<datalist id="tts-model-list">
+											{#each models as model}
+												<option value={model.id} class="bg-gray-50 dark:bg-gray-700" />
+											{/each}
+										</datalist>
+									</div>
+								</div>
+							</div>
+						</div>
 					{/if}
 				</div>
 
@@ -803,7 +862,7 @@
 					<div class="self-center text-xs font-medium">{$i18n.t('Response splitting')}</div>
 					<div class="flex items-center relative">
 						<select
-							class="dark:bg-gray-900 w-fit pr-8 cursor-pointer rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
+							class="w-fit pr-8 cursor-pointer rounded-sm px-2 p-1 text-xs bg-transparent outline-hidden text-right"
 							aria-label={$i18n.t('Select how to split message text for TTS requests')}
 							bind:value={TTS_SPLIT_ON}
 						>

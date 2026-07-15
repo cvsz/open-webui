@@ -35,12 +35,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount, tick, getContext } from 'svelte';
 
-	import {
-		OLLAMA_API_BASE_URL,
-		OPENAI_API_BASE_URL,
-		WEBUI_API_BASE_URL,
-		WEBUI_BASE_URL
-	} from '$lib/constants';
+	import { WEBUI_BASE_URL } from '$lib/constants';
 	import { WEBUI_NAME, config, user, models, settings } from '$lib/stores';
 
 	import { chatCompletion } from '$lib/apis/openai';
@@ -174,13 +169,18 @@ Based on the user's instruction, update and enhance the existing notes or select
 				: '') +
 			(selectedContent ? `\n<selection>${selectedContent?.text}</selection>` : '');
 
+		// Filter out empty assistant placeholder messages to avoid sending
+		// an empty trailing assistant message as "response prefill", which is
+		// incompatible with enable_thinking in llama.cpp and similar backends.
+		const filteredMessages = messages.filter((m) => !(m.role === 'assistant' && m.content === ''));
+
 		const chatMessages = JSON.parse(
 			JSON.stringify([
 				{
 					role: 'system',
 					content: `${system}`
 				},
-				...messages
+				...filteredMessages
 			])
 		);
 
@@ -189,7 +189,10 @@ Based on the user's instruction, update and enhance the existing notes or select
 			{
 				model: model.id,
 				stream: true,
-				messages: chatMessages
+				messages: chatMessages.map((m) => ({
+					role: m.role,
+					content: m.content
+				}))
 				// ...(files && files.length > 0 ? { files } : {}) // TODO: Decide whether to use native file handling or not
 			},
 			`${WEBUI_BASE_URL}/api`

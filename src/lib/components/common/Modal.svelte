@@ -55,18 +55,48 @@
 		mounted = true;
 	});
 
+	let handleOutsidePointerDown;
+	let handleModalFocusIn;
+
 	$: if (show && modalElement) {
 		document.body.appendChild(modalElement);
 		focusTrap = FocusTrap.createFocusTrap(modalElement, {
 			allowOutsideClick: (e) => {
-				return e.target.closest('[data-sonner-toast]') !== null;
+				return (
+					e.target.closest('[data-sonner-toast]') !== null ||
+					e.target.closest('.modal-content') === null
+				);
 			}
 		});
 		focusTrap.activate();
+
+		// Auto-pause focus trap when interacting with portaled content (e.g. Dropdown)
+		handleOutsidePointerDown = (e) => {
+			if (focusTrap && modalElement && !modalElement.contains(e.target)) {
+				focusTrap.pause();
+			}
+		};
+		handleModalFocusIn = () => {
+			if (focusTrap) {
+				focusTrap.unpause();
+			}
+		};
+		document.addEventListener('pointerdown', handleOutsidePointerDown, true);
+		modalElement.addEventListener('focusin', handleModalFocusIn);
+
 		window.addEventListener('keydown', handleKeyDown);
 		document.body.style.overflow = 'hidden';
 	} else if (modalElement) {
-		focusTrap.deactivate();
+		if (focusTrap) {
+			focusTrap.deactivate();
+			focusTrap = null;
+		}
+		if (handleOutsidePointerDown) {
+			document.removeEventListener('pointerdown', handleOutsidePointerDown, true);
+		}
+		if (handleModalFocusIn) {
+			modalElement.removeEventListener('focusin', handleModalFocusIn);
+		}
 		window.removeEventListener('keydown', handleKeyDown);
 		document.body.removeChild(modalElement);
 		document.body.style.overflow = 'unset';

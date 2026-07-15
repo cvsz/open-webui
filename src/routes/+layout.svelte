@@ -16,8 +16,10 @@
 		theme,
 		WEBUI_NAME,
 		WEBUI_VERSION,
+		WEBUI_DEPLOYMENT_ID,
 		mobile,
 		socket,
+		socketConnected,
 		chatId,
 		chats,
 		currentChatPage,
@@ -27,8 +29,17 @@
 		isApp,
 		appInfo,
 		toolServers,
-		playingNotificationSound
+		playingNotificationSound,
+		channels,
+		channelId,
+		terminalServers,
+		showControls,
+		showFileNavPath,
+		showFileNavDir,
+		pyodideWorker,
+		desktopEvent
 	} from '$lib/stores';
+	import { getFileContentById } from '$lib/apis/files';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { beforeNavigate } from '$app/navigation';
@@ -40,21 +51,47 @@
 	import '../app.css';
 	import 'tippy.js/dist/tippy.css';
 
-	import { executeToolServer, getBackendConfig, getVersion } from '$lib/apis';
-	import { getSessionUser, userSignOut } from '$lib/apis/auths';
+	import { executeToolServer, getBackendConfig, getModels, getVersion } from '$lib/apis';
+	import { getSessionUser, updateUserTimezone, userSignOut } from '$lib/apis/auths';
 	import { getAllTags, getChatList } from '$lib/apis/chats';
 	import { chatCompletion } from '$lib/apis/openai';
+	import {
+		addOpenAIConnection,
+		removeOpenAIConnection,
+		addTerminalConnection,
+		removeTerminalConnection
+	} from '$lib/utils/connections';
 
-	import { WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
-	import { bestMatchingLanguage } from '$lib/utils';
+	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL, WEBUI_HOSTNAME } from '$lib/constants';
+	import { bestMatchingLanguage, displayFileHandler, getUserTimezone } from '$lib/utils';
+	import { setTextScale } from '$lib/utils/text-scale';
 
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
+	import SyncStatsModal from '$lib/components/chat/Settings/SyncStatsModal.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
+	import { getUserSettings } from '$lib/apis/users';
+	import dayjs from 'dayjs';
+	import { getChannels } from '$lib/apis/channels';
+
+	const unregisterServiceWorkers = async () => {
+		if ('serviceWorker' in navigator) {
+			try {
+				const registrations = await navigator.serviceWorker.getRegistrations();
+				await Promise.all(registrations.map((r) => r.unregister()));
+				return true;
+			} catch (error) {
+				console.error('Error unregistering service workers:', error);
+				return false;
+			}
+		}
+		return false;
+	};
 
 	// handle frontend updates (https://svelte.dev/docs/kit/configuration#version)
-	beforeNavigate(({ willUnload, to }) => {
+	beforeNavigate(async ({ willUnload, to }) => {
 		if (updated.current && !willUnload && to?.url) {
+			await unregisterServiceWorkers();
 			location.href = to.url.href;
 		}
 	});
@@ -67,6 +104,11 @@
 	let tokenTimer = null;
 
 	let showRefresh = false;
+
+	let showSyncStatsModal = false;
+	let syncStatsEventData = null;
+
+	let heartbeatInterval = null;
 
 	const BREAKPOINT = 768;
 
@@ -86,15 +128,48 @@
 			console.log('connect_error', err);
 		});
 
+		let hasConnectedOnce = false;
+
 		_socket.on('connect', async () => {
 			console.log('connected', _socket.id);
-			const version = await getVersion(localStorage.token);
-			if (version !== null) {
-				if ($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) {
+
+			if (hasConnectedOnce) {
+				socketConnected.set(true);
+				toast.success($i18n.t('Reconnected'));
+			}
+			hasConnectedOnce = true;
+
+			const res = await getVersion(localStorage.token);
+
+			const deploymentId = res?.deployment_id ?? null;
+			const version = res?.version ?? null;
+
+			if (version !== null || deploymentId !== null) {
+				if (
+					($WEBUI_VERSION !== null && version !== $WEBUI_VERSION) ||
+					($WEBUI_DEPLOYMENT_ID !== null && deploymentId !== $WEBUI_DEPLOYMENT_ID)
+				) {
+					await unregisterServiceWorkers();
 					location.href = location.href;
-				} else {
-					WEBUI_VERSION.set(version);
+					return;
 				}
+			}
+
+			// Send heartbeat every 30 seconds
+			heartbeatInterval = setInterval(() => {
+				if (_socket.connected) {
+					console.log('Sending heartbeat');
+					_socket.emit('heartbeat', {});
+				}
+			}, 30000);
+
+			if (deploymentId !== null) {
+				WEBUI_DEPLOYMENT_ID.set(deploymentId);
+			}
+
+			if (version !== null) {
+				WEBUI_VERSION.set(version);
+				window.WEBUI_VERSION = version;
 			}
 
 			console.log('version', version);
@@ -117,13 +192,34 @@
 
 		_socket.on('disconnect', (reason, details) => {
 			console.log(`Socket ${_socket.id} disconnected due to ${reason}`);
+			socketConnected.set(false);
+			toast.warning($i18n.t('Connection lost. Reconnecting...'));
+
+			if (heartbeatInterval) {
+				clearInterval(heartbeatInterval);
+				heartbeatInterval = null;
+			}
+
 			if (details) {
 				console.log('Additional details:', details);
 			}
 		});
 	};
 
-	const executePythonAsWorker = async (id, code, cb) => {
+	/**
+	 * Get or create the persistent Pyodide worker.
+	 * The worker persists across executions so the virtual FS (IDBFS) is preserved.
+	 */
+	const getOrCreateWorker = () => {
+		let worker = $pyodideWorker;
+		if (!worker) {
+			worker = new PyodideWorker();
+			pyodideWorker.set(worker);
+		}
+		return worker;
+	};
+
+	const executePythonAsWorker = async (id, code, cb, files = []) => {
 		let result = null;
 		let stdout = null;
 		let stderr = null;
@@ -145,19 +241,44 @@
 			/\bimport\s+pytz\b|\bfrom\s+pytz\b/.test(code) ? 'pytz' : null
 		].filter(Boolean);
 
-		const pyodideWorker = new PyodideWorker();
+		const worker = getOrCreateWorker();
 
-		pyodideWorker.postMessage({
+		// Fetch file content from the server and prepare for the worker
+		let filePayloads = [];
+		if (files && files.length > 0) {
+			for (const file of files) {
+				try {
+					const fileId = file?.id;
+					const fileName = file?.filename || file?.name || 'file';
+					if (fileId) {
+						const content = await getFileContentById(fileId);
+						if (content) {
+							filePayloads.push({ name: fileName, data: content });
+						}
+					}
+				} catch (e) {
+					console.error('Failed to fetch file for Pyodide:', e);
+				}
+			}
+		}
+
+		worker.postMessage({
+			type: 'execute',
 			id: id,
 			code: code,
-			packages: packages
+			packages: packages,
+			files: filePayloads.length > 0 ? filePayloads : undefined
 		});
 
-		setTimeout(() => {
+		// Timeout for this specific execution (not the worker itself)
+		let timeoutId = setTimeout(() => {
 			if (executing) {
 				executing = false;
 				stderr = 'Execution Time Limit Exceeded';
-				pyodideWorker.terminate();
+
+				// Terminate and recreate the worker on timeout
+				worker.terminate();
+				pyodideWorker.set(null);
 
 				if (cb) {
 					cb(
@@ -176,11 +297,18 @@
 			}
 		}, 60000);
 
-		pyodideWorker.onmessage = (event) => {
-			console.log('pyodideWorker.onmessage', event);
-			const { id, ...data } = event.data;
+		// Use addEventListener so multiple concurrent executions don't clobber each other
+		const onMessage = (event) => {
+			const { id: eventId, ...data } = event.data;
+			// Only handle responses for this execution ID
+			if (eventId !== id) return;
+			// Ignore FS responses (they use a type field)
+			if (data.type && data.type.startsWith('fs:')) return;
 
-			console.log(id, data);
+			console.log('pyodideWorker.onmessage', event);
+			clearTimeout(timeoutId);
+			worker.removeEventListener('message', onMessage);
+			worker.removeEventListener('error', onError);
 
 			data['stdout'] && (stdout = data['stdout']);
 			data['stderr'] && (stderr = data['stderr']);
@@ -204,8 +332,11 @@
 			executing = false;
 		};
 
-		pyodideWorker.onerror = (event) => {
+		const onError = (event) => {
 			console.log('pyodideWorker.onerror', event);
+			clearTimeout(timeoutId);
+			worker.removeEventListener('message', onMessage);
+			worker.removeEventListener('error', onError);
 
 			if (cb) {
 				cb(
@@ -223,48 +354,74 @@
 			}
 			executing = false;
 		};
+
+		worker.addEventListener('message', onMessage);
+		worker.addEventListener('error', onError);
 	};
 
-	const executeTool = async (data, cb) => {
-		const toolServer = $settings?.toolServers?.find((server) => server.url === data.server?.url);
-		const toolServerData = $toolServers?.find((server) => server.url === data.server?.url);
+	const resolveToolServer = (serverUrl) => {
+		let toolServer = $settings?.toolServers?.find((server) => server.url === serverUrl);
+		if (!toolServer) {
+			const terminalServer = ($settings?.terminalServers ?? []).find(
+				(server) => server.url === serverUrl
+			);
+			if (terminalServer) {
+				toolServer = {
+					url: terminalServer.url,
+					auth_type: terminalServer.auth_type ?? 'bearer',
+					key: terminalServer.key ?? '',
+					path: terminalServer.path ?? '/openapi.json'
+				};
+			}
+		}
+
+		let toolServerData =
+			$toolServers?.find((server) => server.url === serverUrl) ??
+			$terminalServers?.find((server) => server.url === serverUrl);
+
+		let token = null;
+		if (toolServer) {
+			const auth_type = toolServer?.auth_type ?? 'bearer';
+			if (auth_type === 'bearer') token = toolServer?.key;
+			else if (auth_type === 'session') token = localStorage.token;
+		}
+
+		return { toolServer, toolServerData, token };
+	};
+
+	const executeTool = async (data, cb, chatId) => {
+		const { toolServer, toolServerData, token } = resolveToolServer(data.server?.url);
 
 		console.log('executeTool', data, toolServer);
 
 		if (toolServer) {
-			console.log(toolServer);
-
-			let toolServerToken = null;
-			const auth_type = toolServer?.auth_type ?? 'bearer';
-			if (auth_type === 'bearer') {
-				toolServerToken = toolServer?.key;
-			} else if (auth_type === 'none') {
-				// No authentication
-			} else if (auth_type === 'session') {
-				toolServerToken = localStorage.token;
-			}
-
 			const res = await executeToolServer(
-				toolServerToken,
+				token,
 				toolServer.url,
 				data?.name,
 				data?.params,
-				toolServerData
+				toolServerData,
+				chatId
 			);
 
 			console.log('executeToolServer', res);
+
+			if (data?.name === 'display_file' && data?.params?.path) {
+				if (res?.exists !== false) {
+					displayFileHandler(data.params.path, { showControls, showFileNavPath });
+				}
+			}
+
+			if (['write_file'].includes(data?.name) && data?.params?.path) {
+				showFileNavDir.set(res?.path ?? data.params.path);
+			}
+
 			if (cb) {
-				cb(JSON.parse(JSON.stringify(res)));
+				cb(structuredClone(res));
 			}
 		} else {
 			if (cb) {
-				cb(
-					JSON.parse(
-						JSON.stringify({
-							error: 'Tool Server Not Found'
-						})
-					)
-				);
+				cb({ error: 'Tool Server Not Found' });
 			}
 		}
 	};
@@ -272,13 +429,21 @@
 	const chatEventHandler = async (event, cb) => {
 		const chat = $page.url.pathname.includes(`/c/${event.chat_id}`);
 
-		let isFocused = document.visibilityState !== 'visible';
+		// Skip events from temporary chats that are not the current chat.
+		// This prevents notifications from being sent to other tabs/devices
+		// for privacy, since temporary chats are not meant to be persisted or visible elsewhere.
+		const isTemporaryChat = event.chat_id?.startsWith('local:');
+		if (isTemporaryChat && event.chat_id !== $chatId) {
+			return;
+		}
+
+		let isInBackground = document.visibilityState !== 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
 				type: 'window:isFocused'
 			});
 			if (res) {
-				isFocused = res.isFocused;
+				isInBackground = !res.isFocused;
 			}
 		}
 
@@ -286,12 +451,48 @@
 		const type = event?.data?.type ?? null;
 		const data = event?.data?.data ?? null;
 
-		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isFocused) {
+		// Calendar alerts are not chat-scoped — handle before chat_id checks
+		if (type === 'calendar:alert' && data) {
+			const timeStr =
+				data.minutes_until <= 0
+					? $i18n.t('Starting now')
+					: data.minutes_until === 1
+						? $i18n.t('Starting in 1 minute')
+						: $i18n.t('Starting in {{count}} minutes', { count: data.minutes_until });
+
+			toast.custom(NotificationToast, {
+				componentProps: {
+					onClick: () => {
+						goto('/calendar');
+					},
+					title: data.title,
+					content: timeStr
+				},
+				duration: 30000,
+				unstyled: true
+			});
+
+			if ($isLastActiveTab) {
+				if ($settings?.notificationEnabled ?? false) {
+					new Notification(`${data.title} • Open WebUI`, {
+						body: timeStr,
+						icon: `${WEBUI_BASE_URL}/static/favicon.png`
+					});
+				}
+			}
+			return;
+		}
+
+		if ((event.chat_id !== $chatId && !$temporaryChatEnabled) || isInBackground) {
 			if (type === 'chat:completion') {
 				const { done, content, title } = data;
+				const displayTitle = title || $i18n.t('New Chat');
 
 				if (done) {
-					if ($settings?.notificationSoundAlways ?? false) {
+					if (
+						($settings?.notificationSound ?? true) &&
+						($settings?.notificationSoundAlways ?? false)
+					) {
 						playingNotificationSound.set(true);
 
 						const audio = new Audio(`/audio/notification.mp3`);
@@ -303,7 +504,7 @@
 
 					if ($isLastActiveTab) {
 						if ($settings?.notificationEnabled ?? false) {
-							new Notification(`${title} • Open WebUI`, {
+							new Notification(`${displayTitle} • Open WebUI`, {
 								body: content,
 								icon: `${WEBUI_BASE_URL}/static/favicon.png`
 							});
@@ -316,7 +517,7 @@
 								goto(`/c/${event.chat_id}`);
 							},
 							content: content,
-							title: title
+							title: displayTitle
 						},
 						duration: 15000,
 						unstyled: true
@@ -331,10 +532,10 @@
 		} else if (data?.session_id === $socket.id) {
 			if (type === 'execute:python') {
 				console.log('execute:python', data);
-				executePythonAsWorker(data.id, data.code, cb);
+				executePythonAsWorker(data.id, data.code, cb, data.files || []);
 			} else if (type === 'execute:tool') {
 				console.log('execute:tool', data);
-				executeTool(data, cb);
+				executeTool(data, cb, event.chat_id);
 			} else if (type === 'request:chat:completion') {
 				console.log(data, $socket.id);
 				const { session_id, channel, form_data, model } = data;
@@ -427,34 +628,88 @@
 	};
 
 	const channelEventHandler = async (event) => {
+		console.log('channelEventHandler', event);
 		if (event.data?.type === 'typing') {
+			return;
+		}
+
+		// handle channel created event
+		if (event.data?.type === 'channel:created') {
+			const res = await getChannels(localStorage.token).catch(async (error) => {
+				return null;
+			});
+
+			if (res) {
+				await channels.set(
+					res.sort(
+						(a, b) =>
+							['', null, 'group', 'dm'].indexOf(a.type) - ['', null, 'group', 'dm'].indexOf(b.type)
+					)
+				);
+			}
+
 			return;
 		}
 
 		// check url path
 		const channel = $page.url.pathname.includes(`/channels/${event.channel_id}`);
 
-		let isFocused = document.visibilityState !== 'visible';
+		let isInBackground = document.visibilityState !== 'visible';
 		if (window.electronAPI) {
 			const res = await window.electronAPI.send({
 				type: 'window:isFocused'
 			});
 			if (res) {
-				isFocused = res.isFocused;
+				isInBackground = !res.isFocused;
 			}
 		}
 
-		if ((!channel || isFocused) && event?.user?.id !== $user?.id) {
+		if ((!channel || isInBackground) && event?.user?.id !== $user?.id) {
 			await tick();
 			const type = event?.data?.type ?? null;
 			const data = event?.data?.data ?? null;
 
+			if ($channels) {
+				if ($channels.find((ch) => ch.id === event.channel_id) && $channelId !== event.channel_id) {
+					channels.set(
+						$channels.map((ch) => {
+							if (ch.id === event.channel_id) {
+								if (type === 'message') {
+									return {
+										...ch,
+										unread_count: (ch.unread_count ?? 0) + 1,
+										last_message_at: event.created_at
+									};
+								}
+							}
+							return ch;
+						})
+					);
+				} else {
+					const res = await getChannels(localStorage.token).catch(async (error) => {
+						return null;
+					});
+
+					if (res) {
+						await channels.set(
+							res.sort(
+								(a, b) =>
+									['', null, 'group', 'dm'].indexOf(a.type) -
+									['', null, 'group', 'dm'].indexOf(b.type)
+							)
+						);
+					}
+				}
+			}
+
 			if (type === 'message') {
+				const title = `${data?.user?.name}${event?.channel?.type !== 'dm' ? ` (#${event?.channel?.name})` : ''}`;
+
 				if ($isLastActiveTab) {
 					if ($settings?.notificationEnabled ?? false) {
-						new Notification(`${data?.user?.name} (#${event?.channel?.name}) • Open WebUI`, {
+						new Notification(`${title} • Open WebUI`, {
 							body: data?.content,
-							icon: data?.user?.profile_image_url ?? `${WEBUI_BASE_URL}/static/favicon.png`
+							icon: `${WEBUI_API_BASE_URL}/users/${data?.user?.id}/profile/image`
 						});
 					}
 				}
@@ -465,7 +720,7 @@
 							goto(`/channels/${event.channel_id}`);
 						},
 						content: data?.content,
-						title: `#${event?.channel?.name}`
+						title: `${title}`
 					},
 					duration: 15000,
 					unstyled: true
@@ -493,7 +748,111 @@
 		}
 	};
 
+	const desktopEventHandler = async (event) => {
+		// Events that don't require auth
+		if (event.type === 'page:reload') {
+			location.reload();
+			return;
+		}
+		if (event.type === 'page:navigate' && event.data?.path) {
+			await goto(event.data.path);
+			return;
+		}
+		if (event.type === 'query' && (event.data?.query || event.data?.files?.length)) {
+			desktopEvent.set(event);
+			await goto('/');
+			return;
+		}
+		if (event.type === 'call') {
+			desktopEvent.set(event);
+			await goto('/');
+			return;
+		}
+		if (event.type === 'theme:update' && event.data?.theme) {
+			const newTheme = event.data.theme;
+			localStorage.setItem('theme', newTheme);
+			theme.set(newTheme);
+
+			// Apply theme classes (mirrors logic from chat/Settings/General.svelte)
+			const themes = ['dark', 'light', 'oled-dark'];
+			let themeToApply =
+				newTheme === 'oled-dark' ? 'dark' : newTheme === 'her' ? 'light' : newTheme;
+			if (newTheme === 'system') {
+				themeToApply = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+			}
+			themes
+				.filter((e) => e !== themeToApply)
+				.forEach((e) => {
+					e.split(' ').forEach((cls) => document.documentElement.classList.remove(cls));
+				});
+			themeToApply.split(' ').forEach((cls) => document.documentElement.classList.add(cls));
+			return;
+		}
+		if (event.type === 'models:refresh') {
+			const token = localStorage.token;
+			if (token) {
+				models.set(
+					await getModels(
+						token,
+						$config?.features?.enable_direct_connections
+							? ($settings?.directConnections ?? null)
+							: null
+					)
+				);
+			}
+			return;
+		}
+
+		const token = localStorage.token;
+		if (!token) return;
+
+		// Only admins can modify system-level connections
+		if ($user?.role !== 'admin') return;
+
+		try {
+			if (event.type === 'connections:terminal') {
+				if (event.data.action === 'add') {
+					await addTerminalConnection(token, {
+						url: event.data.url,
+						key: event.data.key,
+						name: 'Local Open Terminal'
+					});
+				} else if (event.data.action === 'remove') {
+					await removeTerminalConnection(token, event.data.url);
+				}
+			} else if (event.type === 'connections:openai') {
+				if (event.data.action === 'add') {
+					await addOpenAIConnection(token, {
+						url: event.data.url,
+						key: event.data.key
+					});
+				} else if (event.data.action === 'remove') {
+					await removeOpenAIConnection(token, event.data.url);
+				}
+			}
+		} catch (e) {
+			console.error('Desktop connection update failed:', e);
+		}
+	};
+
+	const windowMessageEventHandler = async (event) => {
+		if (
+			!['https://openwebui.com', 'https://www.openwebui.com', 'http://localhost:9999'].includes(
+				event.origin
+			)
+		) {
+			return;
+		}
+
+		if (event.data === 'export:stats' || event.data?.type === 'export:stats') {
+			syncStatsEventData = event.data;
+			showSyncStatsModal = true;
+		}
+	};
+
 	onMount(async () => {
+		window.addEventListener('message', windowMessageEventHandler);
+
 		let touchstartY = 0;
 
 		function isNavOrDescendant(el) {
@@ -501,12 +860,12 @@
 			return nav && (el === nav || nav.contains(el));
 		}
 
-		document.addEventListener('touchstart', (e) => {
+		const touchstartHandler = (e) => {
 			if (!isNavOrDescendant(e.target)) return;
 			touchstartY = e.touches[0].clientY;
-		});
+		};
 
-		document.addEventListener('touchmove', (e) => {
+		const touchmoveHandler = (e) => {
 			if (!isNavOrDescendant(e.target)) return;
 			const touchY = e.touches[0].clientY;
 			const touchDiff = touchY - touchstartY;
@@ -514,18 +873,24 @@
 				showRefresh = true;
 				e.preventDefault();
 			}
-		});
+		};
 
-		document.addEventListener('touchend', (e) => {
+		const touchendHandler = (e) => {
 			if (!isNavOrDescendant(e.target)) return;
 			if (showRefresh) {
 				showRefresh = false;
 				location.reload();
 			}
-		});
+		};
 
-		if (typeof window !== 'undefined' && window.applyTheme) {
-			window.applyTheme();
+		document.addEventListener('touchstart', touchstartHandler);
+		document.addEventListener('touchmove', touchmoveHandler, { passive: false });
+		document.addEventListener('touchend', touchendHandler);
+
+		if (typeof window !== 'undefined') {
+			if (window.applyTheme) {
+				window.applyTheme();
+			}
 		}
 
 		if (window?.electronAPI) {
@@ -544,6 +909,11 @@
 				if (data) {
 					appData.set(data);
 				}
+			}
+
+			// Listen for desktop service lifecycle events (scalable protocol)
+			if (window.electronAPI.onEvent) {
+				window.electronAPI.onEvent(desktopEventHandler);
 			}
 		}
 
@@ -584,13 +954,21 @@
 		};
 		window.addEventListener('resize', onResize);
 
-		user.subscribe((value) => {
+		user.subscribe(async (value) => {
 			if (value) {
 				$socket?.off('events', chatEventHandler);
 				$socket?.off('events:channel', channelEventHandler);
 
 				$socket?.on('events', chatEventHandler);
 				$socket?.on('events:channel', channelEventHandler);
+
+				const userSettings = await getUserSettings(localStorage.token);
+				if (userSettings) {
+					settings.set(userSettings.ui);
+				} else {
+					settings.set(JSON.parse(localStorage.getItem('settings') ?? '{}'));
+				}
+				setTextScale($settings?.textScale ?? 1);
 
 				// Set up the token expiry check
 				if (tokenTimer) {
@@ -608,6 +986,12 @@
 			backendConfig = await getBackendConfig();
 			console.log('Backend config:', backendConfig);
 		} catch (error) {
+			if (error?.authRedirect) {
+				// Forward-auth proxy is redirecting to an external login page.
+				// Full-page navigation lets the browser follow the redirect natively.
+				window.location.href = '/';
+				return;
+			}
 			console.error('Error loading backend config:', error);
 		}
 		// Initialize i18n even if we didn't get a backend config,
@@ -619,10 +1003,11 @@
 			const browserLanguages = navigator.languages
 				? navigator.languages
 				: [navigator.language || navigator.userLanguage];
-			const lang = backendConfig.default_locale
+			const lang = backendConfig?.default_locale
 				? backendConfig.default_locale
 				: bestMatchingLanguage(languages, browserLanguages, 'en-US');
 			changeLanguage(lang);
+			dayjs.locale(lang);
 		}
 
 		if (backendConfig) {
@@ -645,7 +1030,27 @@
 
 					if (sessionUser) {
 						await user.set(sessionUser);
-						await config.set(await getBackendConfig());
+						try {
+							await config.set(await getBackendConfig());
+						} catch (error) {
+							console.error('Error refreshing backend config:', error);
+						}
+
+						// Keep user timezone in sync on every app load/refresh
+						const timezone = getUserTimezone();
+						if (timezone) {
+							updateUserTimezone(localStorage.token, timezone);
+						}
+
+						// Relay auth token to desktop app for API access
+						if (window.electronAPI?.send) {
+							window.electronAPI
+								.send({
+									type: 'token:update',
+									token: localStorage.token
+								})
+								.catch(() => {});
+						}
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
@@ -696,9 +1101,27 @@
 			loaded = true;
 		}
 
+		// Auto-show SyncStatsModal when opened with ?sync=true (from community)
+		if (
+			(window.opener ?? false) &&
+			$page.url.searchParams.get('sync') === 'true' &&
+			($config?.features?.enable_community_sharing ?? false)
+		) {
+			showSyncStatsModal = true;
+		}
+
 		return () => {
 			window.removeEventListener('resize', onResize);
+			window.removeEventListener('message', windowMessageEventHandler);
+			document.removeEventListener('touchstart', touchstartHandler);
+			document.removeEventListener('touchmove', touchmoveHandler);
+			document.removeEventListener('touchend', touchendHandler);
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
 		};
+	});
+
+	onDestroy(() => {
+		bc.close();
 	});
 </script>
 
@@ -735,6 +1158,10 @@
 	{:else}
 		<slot />
 	{/if}
+{/if}
+
+{#if $config?.features.enable_community_sharing}
+	<SyncStatsModal bind:show={showSyncStatsModal} eventData={syncStatsEventData} />
 {/if}
 
 <Toaster
